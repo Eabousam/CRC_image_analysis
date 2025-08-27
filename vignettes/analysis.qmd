@@ -1,0 +1,81 @@
+---
+title: "CRC Image Feature Analysis"
+format:
+  html:
+    theme: yeti
+    highlight-style: tango
+    toc: true
+    toc-depth: 3
+    toc-floating: true
+---
+
+## Image Analysis: TCGAData
+
+#### Setting up environment
+
+```{r}
+#| output: False
+renv::init()
+renv::snapshot()
+renv::status()
+
+```
+
+#### Setting up libraries
+
+```{r}
+#| output: False
+library(BiocManager)
+library(MOFA2)
+library(remotes)
+library(SingleCellExperiment)
+library(SpatialExperiment)
+library(SpatialFeatureExperiment)
+library(MultiAssayExperiment)
+library(curatedTCGAData)
+library(dplyr)
+library(spatstat)
+library(moments)
+library(pracma)
+library(HistoImageR)
+
+
+
+```
+
+#### Load in TCGA CRC data
+
+```{r}
+#| output: False
+# Load COAD data with multiple assays
+coad_mae <- curatedTCGAData(
+    diseaseCode = "COAD",
+    assays = c("RNASeq2GeneNorm", "Methylation450K", "miRNASeqGene"),
+    version = "2.1.1",
+    dry.run = FALSE
+)
+# Load READ data (rectal)
+read_mae <- curatedTCGAData(
+    diseaseCode = "READ",
+    assays = c("RNASeq2GeneNorm", "Methylation450K", "miRNASeqGene"),
+    version = "2.1.1",
+    dry.run = FALSE
+)
+
+# Combine COAD + READ
+crc_tcga <- c(coad_mae, read_mae)
+
+
+
+```
+
+#### Clinical Metadata
+
+```{r}
+#| output: False
+clinical_crc_tcga <- colData(crc_tcga)
+glimpse(clinical_crc_tcga)
+
+# Combining clinical data with test data
+
+```

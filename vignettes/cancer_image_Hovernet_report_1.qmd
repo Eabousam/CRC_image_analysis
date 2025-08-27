@@ -1,0 +1,221 @@
+---
+title: "Cancer_imaging_analysis"
+output: html_document
+date: "2025-04-10"
+---
+
+```{r setup, include=FALSE}
+library(gtsummary)
+library(ggplot2)
+library(readxl)
+library(ggcorrplot)
+library(dplyr)
+library(viridis)
+library(ggbiplot)
+library(Rtsne)
+library(visdat)
+library(curatedTCGAData)
+library(MultiAssayExperiment)
+library(ExperimentHub)
+library(survival)
+library(survminer)
+library(tidyverse)
+```
+
+
+## Read Data
+
+### TCA image data
+```{r}
+# TCA Data
+tca_ovar = read_excel("TCGA_OV_complete_filtered.xlsx")
+
+
+```
+
+### Clinical Metadata
+
+```{r}
+
+library(ExperimentHub)
+
+ov_meta <- curatedTCGAData(diseaseCode = "OV", assays = "*", version = "1.1.38", dry.run = FALSE)
+
+
+ov_meta <- colData(ov_meta) %>% as.data.frame
+
+
+```
+
+### Full data
+
+```{r}
+
+tca_ovar <- tca_ovar[-1]
+colnames(tca_ovar)[1] <- "patientID"
+
+# select clinical meta data
+columns_to_select <- c(
+  "patientID",                             # patient id
+  "vital_status",                          # Survival status
+  "years_to_birth",                          # Birth date
+  "days_to_death",                         # Time variable for deceased patients
+  "days_to_last_followup",                 # Time variable for censored patients
+  "patient.age_at_initial_pathologic_diagnosis", # Age 
+  "gender",                                # Gender/Sex
+  "ethnicity",                             # Ethnicity
+  "patient.anatomic_neoplasm_subdivision" # Anatomic site 
+  # TBD adding other vars of interest
+
+)
+
+# Select the vars
+ov_meta_select <- ov_meta[, columns_to_select, drop = FALSE]
+
+# Merge TCA and clinical metadata
+ov_full <- merge(tca_ovar, ov_meta_select, by = "patientID", all.x = TRUE)
+
+
+
+
+
+```
+
+
+
+## Check Missingness
+
+```{r}
+
+tca_ovar %>%
+  # drop nas for complete case analysis for smoke_heavy variables
+  vis_miss(sort_miss = F, show_perc = TRUE)
+
+
+ov_full %>%
+  # drop nas for complete case analysis for smoke_heavy variables
+  vis_miss(sort_miss = F, show_perc = TRUE)
+
+names(tca_ovar)
+
+```
+
+
+
+
+
+## New vars
+
+```{r}
+
+
+ov_full$tcga_purity_mean <- rowMeans(
+  data.frame(lapply(ov_full[, c("ESTIMATE", "ABSOLUTE", "LUMP", "IHC", "CPE")], as.numeric)),
+  na.rm = TRUE
+)
+
+ov_full$purity_hovernet <- as.numeric(ov_full$neoplastic)/as.numeric(ov_full$num_nuclei)
+ov_full$inflam_perc <- as.numeric(ov_full$inflammatory)/as.numeric(ov_full$num_nuclei)
+ov_full$strom_perc <- as.numeric(ov_full$stromal)/as.numeric(ov_full$num_nuclei)
+ov_full$benign_perc <- as.numeric(ov_full$benign_epithelial) / as.numeric(ov_full$num_nuclei)
+ov_full$necrot_perc <- as.numeric(ov_full$necrotic)/as.numeric(ov_full$num_nuclei)
+
+```
+
+
+
+## Check the data
+
+
+### Prop of tumor classification
+```{r}
+
+
+# Gather into long format for ggplot
+ov_long <- ov_full[, c( "inflam_perc", "strom_perc", "benign_perc", "necrot_perc")]
+ov_long$id <- seq_len(nrow(ov_long))
+ov_long_tidy <- pivot_longer(ov_long, 
+                             cols = -id, 
+                             names_to = "cell_type", 
+                             values_to = "proportion")
+
+# Make a boxplot
+ggplot(ov_long_tidy, aes(x = cell_type, y = proportion, fill = cell_type)) +
+  geom_boxplot(alpha = 0.7) +
+  theme_minimal(base_size = 14) +
+  labs(title = "Distribution of Cell Type Proportions in Ovarian Cancer Images",
+       x = "Cell Type",
+       y = "Proportion of Nuclei") +
+  scale_fill_brewer(palette = "Set2") +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+names(ov_full)
+```
+
+
+### Surv
+
+```{r}
+df_clean <- ov_full %>%
+  mutate(
+    time = ifelse(!is.na(days_to_death), days_to_death, days_to_last_followup),
+  ) %>%
+ # filter(!is.na(time) & !is.na(status) & !is.na(purity_hovernet)) %>%
+    mutate(
+    purity_group = cut(purity_hovernet,
+                       breaks = quantile(purity_hovernet, probs = c(0, 0.33, 0.67, 1), na.rm = TRUE),
+                       labels = c("Low", "Medium", "High"),
+                       include.lowest = TRUE)
+  )
+
+df_clean$purity_hovernet
+surv_object <- Surv(time = df_clean$time, event = df_clean$vital_status)
+
+km_fit <- survfit(surv_object ~ purity_group, data = df_clean)
+
+ggsurvplot(
+  km_fit,
+  data = df_clean,
+  risk.table = TRUE,
+  pval = TRUE,
+  conf.int = TRUE,
+  xlab = "Days",
+  ylab = "Survival Probability",
+  palette = "Dark2"
+)
+
+```
+
+
+```{R}
+hovernet_percs <- c("inflam_perc", "strom_perc", "benign_perc", "necrot_perc")
+
+for (feature in hovernet_percs) {
+  ov_full$group <- ifelse(ov_full[[feature]] >= median(ov_full[[feature]], na.rm = TRUE), "High", "Low")
+  
+  ov_full$SurvObj <- with(ov_full, Surv(time = pmin(days_to_death, days_to_last_followup, na.rm = TRUE),
+                                      event = vital_status))
+  
+  fit <- survfit(SurvObj ~ group, data = ov_full)
+  
+  print(ggsurvplot(
+    fit,
+    data = ov_full,
+    pval = TRUE,
+    risk.table = TRUE,
+    conf.int = TRUE,
+    title = paste("Survival by", feature),
+    legend.title = feature,
+    legend.labs = c("High", "Low"),
+    palette = c("#D55E00", "#0072B2")
+  ))
+}
+
+
+```
+
+
+
+
+
+
