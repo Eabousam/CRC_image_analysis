@@ -9,7 +9,6 @@ format:
     toc-floating: true
 ---
 
-
 ## Image Analysis: TCGAData
 
 #### Setting up environment
@@ -33,50 +32,299 @@ library(SingleCellExperiment)
 library(SpatialExperiment)
 library(SpatialFeatureExperiment)
 library(MultiAssayExperiment)
+library(SummarizedExperiment)
 library(curatedTCGAData)
 library(dplyr)
 library(spatstat)
 library(moments)
 library(pracma)
 library(HistoImageR)
-
+library(devtools)
+library(ggplot2)
+library(TCGAutils)
+library(rmarkdown)
+library(knitr)
 
 
 ```
 
-#### Load in TCGA CRC data
+#### prov-gigaPath COAD
+
+```{r}
+getwd()
+dir <- "../TCGA_COAD_READ_provgigapath"
+fnames <- list.files(dir, pattern = "\\.csv$", full.names = TRUE)
+length(fnames)  # how many slides
+
+```
+
+#### build embedding matrix
+
+```{r}
+
+# Creating matrix for all the images
+tensor_matrix <- matrix(nrow = length(fnames), ncol = 768)
+slide_ids <- sapply(strsplit(basename(fnames), "\\.csv"), `[`, 1)
+rownames(tensor_matrix) <- slide_ids
+
+for (i in seq_along(fnames)) {
+  tensor_matrix[i,] <- getEmbeddingLayer(fnames[i])
+}
+
+tensor_matrix_full <- na.omit(tensor_matrix)
+tensor_matrix_full
+```
+
+#### Load in TCGA CRC assay experiment data
 
 ```{r}
 #| output: False
+
+# List available Assays
+curatedTCGAData("COAD", "*",version = "2.1.1", dry.run = TRUE) 
+curatedTCGAData("READ", "*",version = "2.1.1", dry.run = TRUE) 
+
+
 # Load COAD data with multiple assays
 coad_mae <- curatedTCGAData(
     diseaseCode = "COAD",
-    assays = c("RNASeq2GeneNorm", "Methylation450K", "miRNASeqGene"),
-    version = "2.1.1",
-    dry.run = FALSE
-)
-# Load READ data (rectal)
-read_mae <- curatedTCGAData(
-    diseaseCode = "READ",
-    assays = c("RNASeq2GeneNorm", "Methylation450K", "miRNASeqGene"),
+    assays = c("COAD_RNASeq2GeneNorm-20160128", "mRNAArray", "miRNASeqGene"),
     version = "2.1.1",
     dry.run = FALSE
 )
 
-# Combine COAD + READ
-crc_tcga <- c(coad_mae, read_mae)
+# Load READ data (rectal)
+read_mae <- curatedTCGAData(
+    diseaseCode = "READ",
+    assays = c("READ_RNASeq2GeneNorm-20160128", "mRNAArray", "miRNASeqGene"),
+    version = "2.1.1",
+    dry.run = FALSE
+)
+
+```
+
+#### Read Clinical Metadata data and subset
+
+```{r}
+#| output: False
+# Extract sample-level metadata for READ
+read_clinical <- colData(read_mae)
+
+# Check completeness of metadata attributes
+completeness <- colSums(!is.na(read_clinical)) / nrow(read_clinical) * 100
+summary(completeness)
+
+# Subset to attributes with >95% completeness and remove technical fields
+read_clinical_sub <- read_clinical[, which(completeness > 95)] %>%
+  as.data.frame() %>%
+  select(-matches("aliquot")) %>%
+  select(-matches("portion"))
+
+
+```
+
+#### Matching embedding with clinical metadata
+
+```{r}
+#| output: False
+
+patient_ids_from_slides <- sapply(strsplit(rownames(tensor_matrix_full), "-"), 
+                                  function(x) paste(x[1:3], collapse = "-"))
+rownames(tensor_matrix_full) <- patient_ids_from_slides
+
+
+for (mae_name in names(crc_mae)) {
+  # Extract the MultiAssayExperiment for this assay
+  mae <- crc_mae[[mae_name]]
+  
+  # Extract patient IDs from the columns of this assay
+  participants_formated <- sapply(colnames(mae), function(x) {
+    paste(strsplit(x, "-")[[1]][1:3], collapse = "-")
+  })
+  
+  # Count how many of these patients have H&E embeddings
+  num_shared <- length(intersect(participants_formated, rownames(tensor_matrix_full)))
+  
+  # Print the result
+  msg <- paste0("H&E images with ", mae_name, " = ", num_shared)
+  print(msg)
+}
 
 
 
 ```
 
-#### Clinical Metadata
+```{r}
+#| output: False
+# Combine COAD + READ clinical metadata for patients that have embeddings
+common_cols <- intersect(colnames(coad_clinical_sub), colnames(read_clinical_sub))
+
+clinical_sub <- rbind(
+  coad_clinical_sub[rownames(coad_clinical_sub) %in% rownames(tensor_matrix_full), common_cols],
+  read_clinical_sub[rownames(read_clinical_sub) %in% rownames(tensor_matrix_full), common_cols]
+)
+
+# Factorize categorical variables with 2–10 unique values
+n <- 2
+m <- 10
+numLv <- apply(clinical_sub, 2, function(x) length(unique(x)))
+slideAttrNames <- names(numLv[numLv >= n & numLv <= m])
+
+for (slideAttrName in slideAttrNames) {
+  clinical_sub[[slideAttrName]] <- as.factor(clinical_sub[[slideAttrName]])
+}
+
+# Final metadata dataframe
+metadata_df <- clinical_sub[slideAttrNames]
+
+# Subset embedding matrix to matching patients
+embedding_matrix <- tensor_matrix_full[rownames(tensor_matrix_full) %in% rownames(metadata_df), ]
+embedding_matrix <- embedding_matrix[!duplicated(rownames(embedding_matrix)), ]
+
+dim(metadata_df)
+dim(embedding_matrix)
+
+# Run embedding separation analysis
+res <- HistoImageR:::analyze_embedding_separation(embedding_matrix, metadata_df)
+
+#res$plots
+```
+
+#### Matching embedding and assay data COAD + READ
 
 ```{r}
 #| output: False
-clinical_crc_tcga <- colData(crc_tcga)
-glimpse(clinical_crc_tcga)
 
-# Combining clinical data with test data
+#----------------------------
+# 1. Load RNASeq assays
+#----------------------------
+coad_mae <- curatedTCGAData(
+    diseaseCode = "COAD",
+    assays = c("RNASeq2GeneNorm"),
+    version = "2.1.1",
+    dry.run = FALSE
+)
+
+read_mae <- curatedTCGAData(
+    diseaseCode = "READ",
+    assays = "RNASeq2GeneNorm",
+    version = "2.1.1",
+    dry.run = FALSE
+)
+
+
+rna_coad <- coad_mae[["COAD_RNASeq2GeneNorm-20160128"]]
+rna_read <- read_mae[["READ_RNASeq2GeneNorm-20160128"]]
+
+
+# Make sure rownames (genes) are consistent across assays
+common_genes <- intersect(rownames(rna_coad_bulk), rownames(rna_read_bulk))
+
+rna_coad_bulk <- rna_coad_bulk[common_genes, ]
+rna_read_bulk <- rna_read_bulk[common_genes, ]
+
+# Merge
+rna_combined <- cbind(rna_coad_bulk, rna_read_bulk)
+
+# Extract patient IDs (first 3 TCGA fields)
+rna_patients <- sapply(strsplit(colnames(rna_combined), "-"),
+                       function(x) paste(x[1:3], collapse = "-"))
+
+colnames(rna_combined) <- rna_patients
+rna_patients <- make.unique(rna_patients)  # avoid dup colnames
+
+### 4. Prepare embedding matrix
+tensor_matrix_unique <- tensor_matrix_full[!duplicated(rownames(tensor_matrix_full)), ]
+rownames(tensor_matrix_unique) <- make.unique(rownames(tensor_matrix_unique))
+
+embedding_patients <- sapply(strsplit(rownames(tensor_matrix_unique), "-"),
+                             function(x) paste(x[1:3], collapse = "-"))
+rownames(tensor_matrix_unique) <- embedding_patients
+
+### 5. Find common patients
+common_patients <- intersect(embedding_patients, colnames(rna_combined))
+length(common_patients)  # how many overlap?
+
+### 6. Subset both data types
+embedding_matched <- tensor_matrix_unique[common_patients, , drop = FALSE]
+rna_matched <- rna_combined[, common_patients, drop = FALSE]
+
+# Remove Inf / -Inf
+rna_matrix <- assay(rna_matched)
+rna_keep <- apply(rna_matrix, 1, function(x) all(is.finite(x)))
+rna_matched_clean <- rna_matched[rna_keep, ]
+
+embedding_matched_clean <- embedding_matched[colnames(rna_matched_clean), , drop = FALSE]
+
+### 7. Build SummarizedExperiments
+rna_se <- SummarizedExperiment(
+  assays = list(counts = assay(rna_matched_clean)),
+  colData = DataFrame(patientID = colnames(rna_matched_clean))
+)
+
+embedding_se <- SummarizedExperiment(
+  assays = list(embedding = t(embedding_matched_clean)),
+  colData = metadata_df[colnames(rna_matched_clean), , drop = FALSE]
+)
+rownames(embedding_se) <- paste0("embed_", seq_len(nrow(embedding_se)))
+
+### 8. Build MultiAssayExperiment
+crc_mae <- MultiAssayExperiment(
+  experiments = list(
+    RNASeq = rna_se, # expression of gene X in patient Y
+    Embedding = embedding_se
+  ),
+  colData = colData(embedding_se)
+)
+
+
+```
+
+#### Running MOFA2 analysis
+
+```{r}
+# Create MOFA object
+mofa_object <- create_mofa(crc_mae)
+views_names(mofa_object)
+samples_names(mofa_object) # patients ~605
+# Define model options
+model_opts <- get_default_model_options(mofa_object)
+model_opts$num_factors <- 15
+
+# Define training options
+train_opts <- get_default_training_options(mofa_object)
+train_opts$convergence_mode <- "slow"
+train_opts$seed <- 42
+
+# Prepare and run MOFA
+mofa_object <- prepare_mofa(
+  object = mofa_object,
+  model_options = model_opts,
+  training_options = train_opts
+)
+
+mofa_object.trained <- run_mofa(
+  mofa_object,
+  outfile = "mofa_model3.hdf5",
+  use_basilisk = TRUE
+)
+
+
+
+
+```
+
+
+#### Analyze MOFA model
+
+```{r}
+# Load the model
+mofa_object.trained <- load_model("mofa_model3.hdf5")
+
+# Checking the model
+mofa_object.trained
+
+# plot var explained
+plot_variance_explained(mofa_object.trained, plot_total = TRUE)
 
 ```
