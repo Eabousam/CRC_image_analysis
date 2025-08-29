@@ -1,0 +1,10 @@
+Package: CRCImageAnalysis
+Type: Package
+Title: Analysis of Prov-GigaPath embeddings for TCGA CRC
+Version: 0.1.0
+Authors@R: person("Abousamra", "Eslam", email = "eslam.abousamra@sph.cuny.edu", role = c("aut", "cre"))
+Description: TCGA colorectal cancer data analysis.
+License: MIT
+Encoding: UTF-8
+LazyData: true
+RoxygenNote: 7.3.2
