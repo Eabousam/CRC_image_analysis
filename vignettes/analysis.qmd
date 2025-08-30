@@ -44,6 +44,7 @@ library(ggplot2)
 library(TCGAutils)
 library(rmarkdown)
 library(knitr)
+library(psych)
 
 
 ```
@@ -72,7 +73,8 @@ for (i in seq_along(fnames)) {
 }
 
 tensor_matrix_full <- na.omit(tensor_matrix)
-tensor_matrix_full
+# Verify the structure matched layer 0 in csv
+structure_of_matrix = as.data.frame(tensor_matrix_full)
 ```
 
 #### Load in TCGA CRC assay experiment data
@@ -255,7 +257,6 @@ rna_keep <- apply(rna_matrix, 1, function(x) all(is.finite(x)))
 rna_matched_clean <- rna_matched[rna_keep, ]
 
 embedding_matched_clean <- embedding_matched[colnames(rna_matched_clean), , drop = FALSE]
-
 ### 7. Build SummarizedExperiments
 rna_se <- SummarizedExperiment(
   assays = list(counts = assay(rna_matched_clean)),
@@ -284,7 +285,7 @@ crc_mae <- MultiAssayExperiment(
 
 ```{r}
 # Create MOFA object
-mofa_object <- create_mofa(crc_mae)
+mofa_object <- create_mofa_from_MultiAssayExperiment(crc_mae)
 views_names(mofa_object)
 samples_names(mofa_object) # patients ~605
 # Define model options
@@ -309,9 +310,6 @@ mofa_object.trained <- run_mofa(
   use_basilisk = TRUE
 )
 
-
-
-
 ```
 
 
@@ -321,10 +319,67 @@ mofa_object.trained <- run_mofa(
 # Load the model
 mofa_object.trained <- load_model("mofa_model3.hdf5")
 
-# Checking the model
-mofa_object.trained
-
-# plot var explained
-plot_variance_explained(mofa_object.trained, plot_total = TRUE)
+met = samples_metadata(mofa_object.trained)
+names(met)
 
 ```
+
+#### Initial visualizations
+
+```{r}
+
+plot_variance_explained(mofa_object.trained, plot_total = TRUE)
+
+# For categorical variables like pathology_T_stage
+plot_factor(mofa_object.trained, 
+            factor = 1, 
+            add_violin= T,
+            color_by = "pathology_T_stage")
+
+features_names(mofa_object.trained)
+calculate_variance_explained_per_sample(
+  mofa_object.trained,
+  views = "all",
+  groups = "all",
+  factors = "all"
+)
+
+
+plot_factor(mofa_object.trained, 
+            factor = c(1,2), 
+            color_by = "pathology_T_stage")
+
+plot_data_heatmap(mofa_object.trained,
+                  factor = 1,
+                  view = "RNASeq",
+                  features = 10,
+                  cluster_rows = F,
+                  cluster_cols = F)
+
+
+plot_data_heatmap(mofa_object.trained,
+                  factor = 1,
+                  view = "Embedding",
+                  features = 10,
+                  cluster_rows = F,
+                  cluster_cols = F)
+
+# See which features are most important for each factor
+plot_top_weights(mofa_object.trained,
+                 view = "RNASeq",
+                 factor = 1,
+                 nfeatures = 10)
+
+plot_top_weights(mofa_object.trained,
+                 view = "Embedding",
+                 factor = 1,
+                 nfeatures = 10)
+
+plot_factor_cor(mofa_object.trained)
+
+```
+
+
+
+
+
