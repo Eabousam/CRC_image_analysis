@@ -312,7 +312,6 @@ mofa_object.trained <- run_mofa(
 
 ```
 
-
 #### Analyze MOFA model
 
 ```{r}
@@ -378,8 +377,3 @@ plot_top_weights(mofa_object.trained,
 plot_factor_cor(mofa_object.trained)
 
 ```
-
-
-
-
-
