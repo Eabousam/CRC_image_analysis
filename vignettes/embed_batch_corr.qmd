@@ -1,0 +1,782 @@
+---
+title: "batch_correction"
+format: html
+editor: visual
+---
+
+## Libraries
+
+
+```{r}
+library(imageFeatureTCGA)
+library(curatedTCGAData)
+library(sva)
+library(limma)
+library(TCGAutils)
+library(dplyr)
+library(plyr)
+library(ggplot2)
+library(patchwork)
+library(vegan)
+library(gt)
+```
+
+
+
+
+# Load slide data catalog
+
+```{r load embeddings}
+# prorvigigapath catalog
+catalog <- getCatalog("provgigapath")
+ 
+# Get unique cancer project IDs
+cancer_types <- unique(catalog$Project.ID)
+cat("Number of cancer types:", length(cancer_types), "\n")
+
+# Create an empty list to hold slide catalogs
+slide_catalogs <- list()
+
+# Loop over each cancer type
+for (proj in cancer_types) {
+  # Filter to slide-level and this project
+  sub <- catalog |>
+    dplyr::filter(level == "slide_level", Project.ID == proj)
+  
+  # Store only if there are slides
+  if (nrow(sub) > 0) {
+    slide_catalogs[[proj]] <- sub
+    cat(proj, ":", nrow(sub), "slides\n")
+  } else {
+    cat(proj, ": no slide-level data\n")
+  }
+}
+
+# Check which cancers are available
+names(slide_catalogs)
+
+```
+
+
+#### Pull Cancer Embedding
+```{r}
+
+
+# Define the helper function
+get_aligned_embedding_metadata <- function(mae_emb) {
+  if (is.null(rownames(mae_emb[["slide_assay"]]))) {
+    rownames(mae_emb[["slide_assay"]]) <- paste0("slide_feat_", seq_len(nrow(mae_emb[["slide_assay"]])))
+  }
+  slide_sm <- sampleMap(mae_emb)[sampleMap(mae_emb)$assay == "slide_assay", ]
+  patients <- unique(slide_sm$primary)
+  aligned <- list()
+  for (nm in names(experiments(mae_emb))) {
+    se <- experiments(mae_emb)[[nm]]
+    mat <- assay(se)
+    sm <- sampleMap(mae_emb)[sampleMap(mae_emb)$assay == nm, ]
+    col_patients <- sm$primary[match(colnames(mat), sm$colname)]
+    patient_mat <- matrix(NA, nrow = nrow(mat), ncol = length(patients),
+                          dimnames = list(rownames(mat), patients))
+    for (pat in patients) {
+      cols <- which(col_patients == pat)
+      if (length(cols) == 1) patient_mat[, pat] <- mat[, cols]
+      else if (length(cols) > 1) patient_mat[, pat] <- rowMeans(mat[, cols, drop = FALSE], na.rm = TRUE)
+    }
+    if (!is.numeric(patient_mat)) {
+      patient_mat <- matrix(as.numeric(patient_mat), nrow = nrow(patient_mat),
+                            dimnames = dimnames(patient_mat))
+    }
+    keep <- rowSums(!is.na(patient_mat)) > 0
+    aligned[[nm]] <- patient_mat[keep, , drop = FALSE]
+  }
+  embed_mat <- t(aligned[["slide_assay"]])
+  embed_mat <- embed_mat[complete.cases(embed_mat), ]
+  coldata <- as.data.frame(colData(mae_emb))
+  coldata$patient <- TCGAbarcode(rownames(coldata), participant = TRUE)
+  meta <- coldata[!duplicated(coldata$patient), ]
+  rownames(meta) <- meta$patient
+  common <- intersect(rownames(embed_mat), rownames(meta))
+  embed_meta <- embed_mat[common, , drop = FALSE]
+  meta_sub <- meta[common, , drop = FALSE]
+  return(list(embed = embed_meta, meta = meta_sub))
+}
+
+# Get list of cancer project IDs from the catalog
+cancer_types <- unique(catalog$Project.ID)
+cat("Total cancer types:", length(cancer_types), "\n")
+
+# Storage lists
+all_embeddings <- list()
+all_metadata  <- list()
+
+for (proj in cancer_types) {
+  cat("\n==== Processing", proj, "====\n")
+  
+  # 1. Slide catalog for this cancer
+  slide_cat <- catalog |>
+    dplyr::filter(level == "slide_level", Project.ID == proj)
+  
+  if (nrow(slide_cat) == 0) {
+    cat("No slides, skipping.\n")
+    next
+  }
+  
+  disease_code <- sub("TCGA-", "", proj)
+  
+  # 2. Download molecular data (only one assay to minimise size)
+  mae <- tryCatch(
+    curatedTCGAData(
+      diseaseCode = disease_code,
+      assays = "RNASeq2GeneNorm",   # widely available
+      version = "2.1.1",
+      dry.run = FALSE
+    ),
+    error = function(e) {
+      cat("  Molecular download failed:", conditionMessage(e), "\n")
+      NULL
+    }
+  )
+  
+  if (is.null(mae)) next
+  
+  # 3. Link slide and molecular data
+  linked <- tryCatch(
+    linkTCGA(mae, slide_cat, redownload = FALSE, parallel = TRUE),
+    error = function(e) {
+      cat("  linkTCGA failed:", conditionMessage(e), "\n")
+      NULL
+    }
+  )
+  
+  if (is.null(linked)) next
+  
+  # 4. Align embeddings per patient
+  aligned <- tryCatch(
+    get_aligned_embedding_metadata(linked),
+    error = function(e) {
+      cat("  Alignment failed:", conditionMessage(e), "\n")
+      NULL
+    }
+  )
+  
+  if (is.null(aligned) || nrow(aligned$embed) == 0) {
+    cat("  No aligned patients.\n")
+    next
+  }
+  
+  # Add cancer type to metadata
+  aligned$meta$Cancer <- sub("TCGA-", "", proj)
+  
+  # Store
+  all_embeddings[[proj]] <- aligned$embed
+  all_metadata[[proj]]  <- aligned$meta
+  
+  cat("  Done – patients:", nrow(aligned$embed), "\n")
+}
+
+saveRDS(all_embeddings, "all_cancer_embeddings.rds")
+
+
+
+names(all_cancer_metadata)
+
+```
+
+
+
+### Combine Embedding
+```{r}
+# ---- 1. Load embeddings if not already in memory ----
+if (!exists("all_embeddings")) {
+  all_embeddings <- readRDS("all_cancer_embeddings.rds")
+}
+
+# ---- 2. Prepare metadata list ----
+# Ensure all_metadata exists
+if (!exists("all_metadata")) {
+  stop("all_metadata not found. Please re-run the loop or load it.")
+}
+
+# Process each metadata element
+for (proj in names(all_metadata)) {
+  meta <- all_metadata[[proj]]
+  
+  # Add Patient column if not present
+  if (!"Patient" %in% colnames(meta)) {
+    if ("patient" %in% colnames(meta)) {
+      meta$Patient <- meta$patient
+    } else {
+      meta$Patient <- rownames(meta)
+    }
+  }
+  
+  # Ensure Patient is participant-level (e.g., TCGA-XX-XXXX)
+  meta$Patient <- TCGAbarcode(meta$Patient, participant = TRUE)
+  
+  # Set rownames to Patient for alignment
+  rownames(meta) <- meta$Patient
+  
+  # Add Cancer column if not present
+  if (!"Cancer" %in% colnames(meta)) {
+    meta$Cancer <- sub("TCGA-", "", proj)
+  }
+  
+  all_metadata[[proj]] <- meta
+}
+
+# ---- 3. Align embedding features ----
+# Check if column names are present
+has_colnames <- any(sapply(all_embeddings, function(mat) !is.null(colnames(mat))))
+
+if (has_colnames) {
+  # Use intersection of feature names
+  common_features <- Reduce(intersect, lapply(all_embeddings, colnames))
+  cat("Common features:", length(common_features), "\n")
+  all_embeddings <- lapply(all_embeddings, function(mat) {
+    mat[, common_features, drop = FALSE]
+  })
+} else {
+  # No column names: assume same order, use minimum column count
+  min_cols <- min(sapply(all_embeddings, ncol))
+  cat("No column names – using minimum columns:", min_cols, "\n")
+  all_embeddings <- lapply(all_embeddings, function(mat) {
+    mat[, 1:min_cols, drop = FALSE]
+  })
+}
+
+# ---- 4. Combine embeddings ----
+embeddings_combined <- do.call(rbind, all_embeddings)
+
+# ---- 5. Combine metadata ----
+metadata_combined_all <- do.call(rbind.fill, all_metadata)
+rownames(metadata_combined_all) <- metadata_combined_all$Patient
+
+# ---- 6. Align patients ----
+common_patients <- intersect(rownames(embeddings_combined), rownames(metadata_combined_all))
+cat("Common patients:", length(common_patients), "\n")
+
+embeddings_combined <- embeddings_combined[common_patients, , drop = FALSE]
+metadata_combined_all <- metadata_combined_all[common_patients, , drop = FALSE]
+
+# ---- 7. Save final combined objects ----
+saveRDS(embeddings_combined, "embeddings_combined_all_cancers.rds")
+saveRDS(metadata_combined_all, "metadata_combined_all_cancers.rds")
+
+cat("Final embeddings dimensions:", dim(embeddings_combined), "\n")
+cat("Final metadata dimensions:", dim(metadata_combined_all), "\n")
+cat("Cancer types:", length(unique(metadata_combined_all$Cancer)), "\n")
+```
+
+
+# Read Embedding
+```{r}
+embeddings_combined = readRDS( "embeddings_combined_all_cancers.rds")
+metadata_combined_all = readRDS("metadata_combined_all_cancers.rds")
+# Fix the index issue, assigning the patient id columns
+rownames(metadata_combined_all) <- metadata_combined_all$patientID
+```
+
+
+### Add batch Var
+
+```{r}
+# 1. Ensure slide_catalogs exists (if not, rebuild from catalog)
+if (!exists("slide_catalogs")) {
+  slide_catalogs <- split(catalog, catalog$Project.ID) %>%
+    lapply(function(df) dplyr::filter(df, level == "slide_level"))
+}
+
+# 2. Build a patient-level lookup table: Patient -> TSS.Code
+tss_lookup <- bind_rows(lapply(slide_catalogs, function(slide_df) {
+  slide_df %>%
+    mutate(Patient = TCGAbarcode(tcga_barcode, participant = TRUE)) %>%
+    select(Patient, TSS.Code) %>%
+    distinct(Patient, .keep_all = TRUE)
+}))
+
+# 3. If metadata_combined_all doesn't have a Patient column, create from rownames
+if (!"Patient" %in% colnames(metadata_combined_all)) {
+  metadata_combined_all$Patient <- rownames(metadata_combined_all)
+}
+
+# 4. Attach TSS.Code via left join
+metadata_combined_all <- metadata_combined_all %>%
+  left_join(tss_lookup, by = "Patient")
+
+# 5. Check for missing TSS.Code
+cat("Missing TSS.Code:", sum(is.na(metadata_combined_all$Tissue.source.site)), "\n")
+
+```
+
+
+# Visualize PCA embed + batch
+
+
+```{r}
+
+
+# Ensure metadata is aligned with embeddings (by patient ID)
+common_ids <- intersect(rownames(embeddings_combined), rownames(metadata_combined_all))
+emb_pca <- embeddings_combined[common_ids, , drop = FALSE]
+meta_pca <- metadata_combined_all[common_ids, , drop = FALSE]
+
+# Run PCA (center and scale for stable results)
+pca_res <- prcomp(emb_pca, center = TRUE, scale. = TRUE)
+
+# Create data frame for plotting
+combined_pca_df <- data.frame(
+  PC1 = pca_res$x[, 1],
+  PC2 = pca_res$x[, 2],
+  Cancer = meta_pca$Cancer,
+  TSS = meta_pca$TSS.Code
+)
+
+# Plot by cancer type
+p_cancer <- ggplot(combined_pca_df, aes(x = PC1, y = PC2, color = Cancer)) +
+  geom_point(size = 1.5, alpha = 0.6) +
+  stat_ellipse(level = 0.95, linetype = 2) +
+  labs(title = "PCA – coloured by cancer type",
+       x = paste0("PC1 (", round(summary(pca_res)$importance[2,1]*100,1), "%)"),
+       y = paste0("PC2 (", round(summary(pca_res)$importance[2,2]*100,1), "%)")) +
+  theme_minimal() +
+    scale_color_viridis_d(option = "turbo")
+
+# Plot by TSS.Code (tissue source site)
+p_tss <- ggplot(combined_pca_df, aes(x = PC1, y = PC2, color = TSS)) +
+  geom_point(size = 1.5, alpha = 0.6) +
+  labs(title = "PCA – coloured by TSS.Code (batch)",
+       x = paste0("PC1 (", round(summary(pca_res)$importance[2,1]*100,1), "%)"),
+       y = paste0("PC2 (", round(summary(pca_res)$importance[2,2]*100,1), "%)")) +
+  theme_minimal() +
+  theme(legend.position = "none")   # too many TSS codes; hide legend for clarity
+
+# display
+p_cancer / p_tss
+```
+
+
+
+# Corrected Permanova
+
+
+```{r}
+# 1. Align embeddings and metadata (by rownames)
+common_ids <- intersect(rownames(embeddings_combined), rownames(metadata_combined_all))
+emb_orig <- embeddings_combined[common_ids, , drop = FALSE]
+meta     <- metadata_combined_all[common_ids, , drop = FALSE]
+
+# 2. Remove rows with missing Cancer or TSS.Code
+keep <- complete.cases(meta$Cancer, meta$TSS.Code)
+meta <- meta[keep, , drop = FALSE]
+emb_orig <- emb_orig[keep, , drop = FALSE]
+
+# 3. Reorder both by rownames to ensure exact alignment
+ord <- order(rownames(emb_orig))
+emb_orig <- emb_orig[ord, , drop = FALSE]
+meta <- meta[ord, , drop = FALSE]
+
+# 4. Convert to factors and drop unused levels
+meta$Cancer   <- droplevels(as.factor(meta$Cancer))
+meta$TSS.Code <- droplevels(as.factor(meta$TSS.Code))
+
+# 5. Transpose embeddings (features x samples)
+embed_t <- t(emb_orig)
+batch   <- meta$TSS.Code
+
+# 5. Batch correction
+# ComBat (no covariates)
+combat_res <- ComBat(dat = embed_t,
+                     batch = batch,
+                     mod = NULL,
+                     par.prior = TRUE,
+                     prior.plots = FALSE)
+emb_combat <- t(combat_res)
+rownames(emb_combat) <- rownames(emb_orig)
+
+# limma removeBatchEffect (with Cancer covariate)
+design_cancer <- model.matrix(~ Cancer , data = meta)
+
+limma_res <- removeBatchEffect(x = embed_t,
+                               batch = batch,
+                               design = design_cancer)
+emb_limma <- t(limma_res)
+rownames(emb_limma) <- rownames(emb_orig)
+
+
+```
+
+
+## Permanova
+```{r}
+
+
+
+# 6. PERMANOVA (sequential, by = "terms")
+library(vegan)
+
+# Original
+dist_orig <- dist(emb_orig, method = "euclidean")
+res_orig <- adonis2(dist_orig ~ Cancer + TSS.Code,
+                    data = meta,
+                    permutations = 99,
+                    by = "terms")
+
+# ComBat
+dist_combat <- dist(emb_combat, method = "euclidean")
+res_combat <- adonis2(dist_combat ~ Cancer + TSS.Code,
+                      data = meta,
+                      permutations = 99,
+                      by = "terms")
+
+# limma
+dist_limma <- dist(emb_limma, method = "euclidean")
+res_limma <- adonis2(dist_limma ~ Cancer + TSS.Code,
+                     data = meta,
+                     permutations = 99,
+                     by = "terms")
+
+# 7. Summary table
+corrected_perm_df <- data.frame(
+  Method = c("Original", "ComBat", "limma"),
+  R2_Cancer = c(res_orig["Cancer", "R2"],
+                res_combat["Cancer", "R2"],
+                res_limma["Cancer", "R2"]),
+  P_Cancer = c(res_orig["Cancer", "Pr(>F)"],
+               res_combat["Cancer", "Pr(>F)"],
+               res_limma["Cancer", "Pr(>F)"]),
+  R2_TSS = c(res_orig["TSS.Code", "R2"],
+             res_combat["TSS.Code", "R2"],
+             res_limma["TSS.Code", "R2"]),
+  P_TSS = c(res_orig["TSS.Code", "Pr(>F)"],
+            res_combat["TSS.Code", "Pr(>F)"],
+            res_limma["TSS.Code", "Pr(>F)"])
+)
+
+print(corrected_perm_df)
+
+
+```
+
+
+
+```{r}
+# ============================================
+# Professional Table 1 + R² Comparison Table
+# ============================================
+library(dplyr)
+library(gt)
+
+# ------------------------------------------------------------------
+# 6. R² comparison table
+# ------------------------------------------------------------------
+if (!exists("corrected_perm_df")) {
+  if (exists("res_orig") & exists("res_combat") & exists("res_limma")) {
+    corrected_perm_df <- data.frame(
+      Method = c("Original", "ComBat", "limma"),
+      R2_Cancer = c(res_orig["Cancer", "R2"],
+                    res_combat["Cancer", "R2"],
+                    res_limma["Cancer", "R2"]),
+      P_Cancer = c(res_orig["Cancer", "Pr(>F)"],
+                   res_combat["Cancer", "Pr(>F)"],
+                   res_limma["Cancer", "Pr(>F)"]),
+      R2_TSS = c(res_orig["TSS.Code", "R2"],
+                 res_combat["TSS.Code", "R2"],
+                 res_limma["TSS.Code", "R2"]),
+      P_TSS = c(res_orig["TSS.Code", "Pr(>F)"],
+                res_combat["TSS.Code", "Pr(>F)"],
+                res_limma["TSS.Code", "Pr(>F)"])
+    )
+  } else {
+    stop("Neither corrected_perm_df nor res_* objects found. Run PERMANOVA first.")
+  }
+}
+
+r2_table_gt <- corrected_perm_df %>%
+  gt() %>%
+  tab_header(
+    title = "Variance explained by cancer type and tissue source site",
+    subtitle = "Sequential PERMANOVA before and after batch correction"
+  ) %>%
+  fmt_number(columns = starts_with("R2"), decimals = 4) %>%
+  fmt_scientific(columns = starts_with("P"), decimals = 3) %>%
+  cols_label(
+    Method = "Method",
+    R2_Cancer = "R² Cancer",
+    P_Cancer = "P Cancer",
+    R2_TSS = "R² Tissue Source Site",
+    P_TSS = "P Tissue Source Site"
+  ) %>%
+  tab_options(
+    table.font.size = 12,
+    heading.align = "center"
+  )
+
+r2_table_gt
+```
+
+
+```{r}
+# ============================================
+# Comprehensive Table 1 + Site Summary
+# ============================================
+
+# ------------------------------------------------------------------
+# 2. Patient and slide counts
+# ------------------------------------------------------------------
+patient_counts <- metadata_combined_all %>%
+  dplyr::count(Cancer, name = "Patients") %>%
+  dplyr::arrange(dplyr::desc(Patients))
+
+slide_counts <- data.frame(
+  Cancer = sub("TCGA-", "", names(slide_catalogs)),
+  Slides = sapply(slide_catalogs, nrow),
+  stringsAsFactors = FALSE
+)
+
+# ------------------------------------------------------------------
+# 3. Birth year summary (median, IQR)
+# ------------------------------------------------------------------
+birth_year_summary <- metadata_combined_all %>%
+  dplyr::filter(!is.na(years_to_birth)) %>%
+  dplyr::group_by(Cancer) %>%
+  dplyr::summarise(
+    `Birth Year (median, IQR)` = paste0(
+      round(median(years_to_birth), 1),
+      " (", round(quantile(years_to_birth, 0.25), 1),
+      ", ", round(quantile(years_to_birth, 0.75), 1), ")"
+    ),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------------
+# 4. Gender summary (% female)
+# ------------------------------------------------------------------
+gender_summary <- metadata_combined_all %>%
+  dplyr::filter(!is.na(gender)) %>%
+  dplyr::group_by(Cancer) %>%
+  dplyr::summarise(
+    `Female (%)` = paste0(
+      sum(gender == "female"), " (", round(100 * mean(gender == "female"), 1), "%)"
+    ),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------------
+# 5. Vital status summary (% deceased, assuming 1 = deceased)
+# ------------------------------------------------------------------
+vital_summary <- metadata_combined_all %>%
+  dplyr::filter(!is.na(vital_status)) %>%
+  dplyr::group_by(Cancer) %>%
+  dplyr::summarise(
+    `Deceased (%)` = paste0(
+      sum(vital_status == 1), " (", round(100 * mean(vital_status == 1), 1), "%)"
+    ),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------------
+# 6. FFPE summary
+# ------------------------------------------------------------------
+ffpe_summary <- metadata_combined_all %>%
+  dplyr::filter(!is.na(patient.samples.sample.is_ffpe)) %>%
+  dplyr::group_by(Cancer) %>%
+  dplyr::summarise(
+    `FFPE (%)` = paste0(
+      sum(patient.samples.sample.is_ffpe == "yes"), " (",
+      round(100 * mean(patient.samples.sample.is_ffpe == "yes"), 1), "%)"
+    ),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------------
+# 7. Tumor nuclei and necrosis summaries
+# ------------------------------------------------------------------
+tumor_nuclei_summary <- metadata_combined_all %>%
+  dplyr::filter(!is.na(patient.samples.sample.portions.portion.slides.slide.percent_tumor_nuclei)) %>%
+  dplyr::group_by(Cancer) %>%
+  dplyr::summarise(
+    `Tumor Nuclei (%)` = paste0(
+      round(median(patient.samples.sample.portions.portion.slides.slide.percent_tumor_nuclei), 1),
+      " (", round(quantile(patient.samples.sample.portions.portion.slides.slide.percent_tumor_nuclei, 0.25), 1),
+      ", ", round(quantile(patient.samples.sample.portions.portion.slides.slide.percent_tumor_nuclei, 0.75), 1), ")"
+    ),
+    .groups = "drop"
+  )
+
+necrosis_summary <- metadata_combined_all %>%
+  dplyr::filter(!is.na(patient.samples.sample.portions.portion.slides.slide.percent_necrosis)) %>%
+  dplyr::group_by(Cancer) %>%
+  dplyr::summarise(
+    `Necrosis (%)` = paste0(
+      round(median(patient.samples.sample.portions.portion.slides.slide.percent_necrosis), 1),
+      " (", round(quantile(patient.samples.sample.portions.portion.slides.slide.percent_necrosis, 0.25), 1),
+      ", ", round(quantile(patient.samples.sample.portions.portion.slides.slide.percent_necrosis, 0.75), 1), ")"
+    ),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------------
+# 8. Predominant histology
+# ------------------------------------------------------------------
+histology_summary <- metadata_combined_all %>%
+  dplyr::filter(!is.na(histological_type)) %>%
+  dplyr::count(Cancer, histological_type) %>%
+  dplyr::group_by(Cancer) %>%
+  dplyr::slice_max(n, n = 1, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(Cancer, `Predominant Histology` = histological_type)
+
+# ------------------------------------------------------------------
+# 9. Site summary (unique sites, top site, second site)
+# ------------------------------------------------------------------
+# Step 1: Count patients per Cancer x TSS.Code
+site_counts <- metadata_combined_all %>%
+  dplyr::filter(!is.na(TSS.Code)) %>%
+  dplyr::count(Cancer, TSS.Code)
+
+# Step 2: Total patients and number of unique sites per cancer
+cancer_summary <- site_counts %>%
+  dplyr::group_by(Cancer) %>%
+  dplyr::summarise(
+    total_patients = sum(n),
+    unique_sites = dplyr::n_distinct(TSS.Code)
+  ) %>%
+  dplyr::ungroup()
+
+# Step 3: Top site
+top1 <- site_counts %>%
+  dplyr::group_by(Cancer) %>%
+  dplyr::slice_max(n, n = 1, with_ties = FALSE) %>%
+  dplyr::rename(top_site = TSS.Code, top_n = n) %>%
+  dplyr::select(Cancer, top_site, top_n) %>%
+  dplyr::ungroup()
+
+# Step 4: Second top site
+top2 <- site_counts %>%
+  dplyr::group_by(Cancer) %>%
+  dplyr::slice_max(n, n = 2, with_ties = FALSE) %>%
+  dplyr::filter(dplyr::row_number() == 2) %>%
+  dplyr::rename(second_site = TSS.Code, second_n = n) %>%
+  dplyr::select(Cancer, second_site, second_n) %>%
+  dplyr::ungroup()
+
+# Step 5: Combine and compute percentages, format as "site (xx.x%)"
+site_summary <- cancer_summary %>%
+  dplyr::left_join(top1, by = "Cancer") %>%
+  dplyr::left_join(top2, by = "Cancer") %>%
+  dplyr::mutate(
+    top_site_pct = 100 * top_n / total_patients,
+    second_site_pct = 100 * second_n / total_patients,
+    `Top Site (%)` = paste0(top_site, " (", round(top_site_pct, 1), "%)"),
+    `Second Site (%)` = ifelse(!is.na(second_site), 
+                               paste0(second_site, " (", round(second_site_pct, 1), "%)"), 
+                               "")
+  ) %>%
+  dplyr::select(Cancer, unique_sites, `Top Site (%)`, `Second Site (%)`)
+
+# ------------------------------------------------------------------
+# 10. Combine everything
+# ------------------------------------------------------------------
+table1_data <- patient_counts %>%
+  dplyr::left_join(slide_counts, by = "Cancer") %>%
+  dplyr::left_join(birth_year_summary, by = "Cancer") %>%
+  dplyr::left_join(gender_summary, by = "Cancer") %>%
+  dplyr::left_join(vital_summary, by = "Cancer") %>%
+  dplyr::left_join(ffpe_summary, by = "Cancer") %>%
+  dplyr::left_join(tumor_nuclei_summary, by = "Cancer") %>%
+  dplyr::left_join(necrosis_summary, by = "Cancer") %>%
+  dplyr::left_join(histology_summary, by = "Cancer") %>%
+  dplyr::left_join(site_summary, by = "Cancer")
+
+# ------------------------------------------------------------------
+# 11. Build Table with gt
+# ------------------------------------------------------------------
+table1_gt <- table1_data %>%
+  gt() %>%
+  tab_header(
+    title = "Table 1. Cohort summary by cancer type",
+    subtitle = "TCGA image embeddings with linked RNASeq data"
+  ) %>%
+  cols_label(
+    Cancer = "Cancer Type",
+    Patients = "Patients",
+    Slides = "Slides",
+    `Birth Year (median, IQR)` = "Birth Year (median, IQR)",
+    `Female (%)` = "Female, n (%)",
+    `Deceased (%)` = "Deceased, n (%)",
+    `FFPE (%)` = "FFPE, n (%)",
+    `Tumor Nuclei (%)` = "Tumor Nuclei % (median, IQR)",
+    `Necrosis (%)` = "Necrosis % (median, IQR)",
+    `Predominant Histology` = "Predominant Histology",
+    unique_sites = "Unique Sites",
+    `Top Site (%)` = "Top Site (%)",
+    `Second Site (%)` = "Second Site (%)"
+  ) %>%
+  fmt_number(columns = c(Patients, Slides), decimals = 0) %>%
+  tab_options(
+    table.font.size = 12,
+    heading.align = "center"
+  )
+
+# Display
+table1_gt
+```
+
+
+
+```{r}
+
+# Step 1: Count patients per Cancer x TSS.Code
+site_counts <- metadata_combined_all %>%
+  dplyr::filter(!is.na(TSS.Code)) %>%
+  dplyr::count(Cancer, TSS.Code)
+
+# Step 2: Total patients and number of unique sites per cancer
+cancer_summary <- site_counts %>%
+  dplyr::group_by(Cancer) %>%
+  dplyr::summarise(
+    total_patients = sum(n),
+    unique_sites = dplyr::n_distinct(TSS.Code)
+  ) %>%
+  dplyr::ungroup()
+
+# Step 3: Top site for each cancer
+top1 <- site_counts %>%
+  dplyr::group_by(Cancer) %>%
+  dplyr::slice_max(n, n = 1, with_ties = FALSE) %>%
+  dplyr::rename(top_site = TSS.Code, top_n = n) %>%
+  dplyr::select(Cancer, top_site, top_n) %>%
+  dplyr::ungroup()
+
+# Step 4: Second top site (if exists)
+top2 <- site_counts %>%
+  dplyr::group_by(Cancer) %>%
+  dplyr::slice_max(n, n = 2, with_ties = FALSE) %>%
+  dplyr::filter(dplyr::row_number() == 2) %>%
+  dplyr::rename(second_site = TSS.Code, second_n = n) %>%
+  dplyr::select(Cancer, second_site, second_n) %>%
+  dplyr::ungroup()
+
+# Step 5: Combine everything
+site_summary <- cancer_summary %>%
+  dplyr::left_join(top1, by = "Cancer") %>%
+  dplyr::left_join(top2, by = "Cancer") %>%
+  dplyr::mutate(
+    top_site_pct = 100 * top_n / total_patients,
+    second_site_pct = 100 * second_n / total_patients
+  ) %>%
+  dplyr::select(
+    Cancer, total_patients, unique_sites,
+    top_site, top_site_pct,
+    second_site, second_site_pct
+  ) %>%
+  dplyr::arrange(dplyr::desc(top_site_pct))
+
+# View result
+print(site_summary, n = Inf)
+
+```
+
+
+
+
